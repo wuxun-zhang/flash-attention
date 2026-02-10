@@ -24,8 +24,11 @@ from torch.utils.cpp_extension import (
     BuildExtension,
     CppExtension,
     CUDAExtension,
+    SyclExtension,
     CUDA_HOME,
     ROCM_HOME,
+    SYCL_HOME,
+    _SYCL_DLINK_FLAGS,
     IS_HIP_EXTENSION,
 )
 
@@ -42,13 +45,24 @@ BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 if BUILD_TARGET == "auto":
     if IS_HIP_EXTENSION:
         IS_ROCM = True
+        IS_XPU = False
+    elif SYCL_HOME is not None and torch.version.xpu is not None:
+        IS_XPU = True
+        IS_ROCM = False
     else:
         IS_ROCM = False
+        IS_XPU = False
 else:
     if BUILD_TARGET == "cuda":
         IS_ROCM = False
     elif BUILD_TARGET == "rocm":
         IS_ROCM = True
+    elif BUILD_TARGET == "xpu":
+        IS_XPU = True
+        IS_ROCM = False
+    else:
+        IS_ROCM = False
+        IS_XPU = False
 
 PACKAGE_NAME = "flash_attn"
 
@@ -173,6 +187,15 @@ def check_if_rocm_home_none(global_option: str) -> None:
         f"{global_option} was requested, but hipcc was not found."
     )
 
+def check_if_xpu_home_none(global_option: str) -> None:
+    if SYCL_HOME is not None:
+        return
+    # warn instead of error because user could be downloading prebuilt wheels, so icpx won't be necessary
+    # in that case.
+    warnings.warn(
+        f"{global_option} was requested, but icpx was not found."
+    )
+
 
 def detect_hipify_v2():
     try:
@@ -194,10 +217,27 @@ def rename_cpp_to_cu(cpp_files):
     for entry in cpp_files:
         shutil.copy(entry, os.path.splitext(entry)[0] + ".cu")
 
+def rename_cpp_to_sycl(cpp_files):
+    for entry in cpp_files:
+        shutil.copy(entry, os.path.splitext(entry)[0] + ".sycl")
+
+def remove_sycl_files(sycl_files):
+    for entry in sycl_files:
+        os.remove(entry)
 
 def validate_and_update_archs(archs):
     # List of allowed architectures
     allowed_archs = ["native", "gfx90a", "gfx950", "gfx942"]
+
+    # Validate if each element in archs is in allowed_archs
+    assert all(
+        arch in allowed_archs for arch in archs
+    ), f"One of GPU archs of {archs} is invalid or not supported by Flash-Attention"
+
+
+def xpu_validate_and_update_archs(archs):
+    # List of allowed architectures
+    allowed_archs = ["native", "pvc", "bmg-g21-a0",]
 
     # Validate if each element in archs is in allowed_archs
     assert all(
@@ -211,9 +251,12 @@ ext_modules = []
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
 if os.path.isdir(".git"):
-    if not SKIP_CK_BUILD:
+    # skip updating submodules for CUDA and ROCm when XPU is enabled
+    if not SKIP_CK_BUILD and not IS_XPU:
         subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
         subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"], check=True)
+    if IS_XPU:
+        subprocess.run(["git", "submodule", "update", "--init", "csrc/sycl-tla"], check=True)
 else:
     if IS_ROCM:
         if not SKIP_CK_BUILD:
@@ -225,7 +268,7 @@ else:
             os.path.exists("csrc/cutlass/include/cutlass/cutlass.h")
         ), "csrc/cutlass is missing, please use source distribution or git clone"
 
-if not SKIP_CUDA_BUILD and not IS_ROCM:
+if not SKIP_CUDA_BUILD and not IS_ROCM and not IS_XPU:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
     TORCH_MAJOR = int(torch.__version__.split(".")[0])
     TORCH_MINOR = int(torch.__version__.split(".")[1])
@@ -368,7 +411,7 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
             ],
         )
     )
-elif not SKIP_CUDA_BUILD and IS_ROCM:
+elif not SKIP_CUDA_BUILD and IS_ROCM and not IS_XPU:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
     TORCH_MAJOR = int(torch.__version__.split(".")[0])
     TORCH_MINOR = int(torch.__version__.split(".")[1])
@@ -486,6 +529,60 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                 include_dirs=include_dirs,
             )
         )
+elif IS_XPU:
+    check_if_xpu_home_none("flash_attn")
+    archs = os.getenv("GPU_ARCHS", "native").split(";")
+    xpu_validate_and_update_archs(archs)
+    print(f"Building for XPU architectures: {archs}")
+
+    if archs == ['native']:
+        arch_name = torch.xpu.get_device_properties().name.lower()
+        arch_str = None
+        if 'b580' in arch_name:
+            arch_str = 'bmg-g21-a0'
+        elif 'gpu max' in arch_name:
+            arch_str = 'pvc'
+        assert arch_str is not None, f"Unsupported XPU architecture: {arch_name}"
+        # cc_flag = [f"-device {arch}"]
+        print(f"Detected specific XPU architecture: {arch_str} from device name: {arch_name}")
+
+    # override Torch default AOT device list
+    os.environ["TORCH_XPU_ARCH_LIST"] = arch_str
+
+    # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
+    # torch._C._GLIBCXX_USE_CXX11_ABI
+    # https://github.com/pytorch/pytorch/blob/8472c24e3b5b60150096486616d98b7bea01500b/torch/utils/cpp_extension.py#L920
+    if FORCE_CXX11_ABI:
+        torch._C._GLIBCXX_USE_CXX11_ABI = True
+
+    sycl_sources = ["csrc/flash_attn_xpu/mha_fwd.cpp"]
+
+    rename_cpp_to_sycl(sycl_sources)
+
+    renamed_sources = ["csrc/flash_attn_xpu/flash_api.cpp",
+                       "csrc/flash_attn_xpu/mha_fwd.sycl"]
+
+    sycl_tla_compile_flags = ["-DCUTLASS_ENABLE_SYCL", "-DSYCL_INTEL_TARGET"]
+    extra_flags = ["-fsycl-targets=spir64_gen",
+                        "-Xspirv-translator",
+                        "-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate"]
+    _SYCL_DLINK_FLAGS += extra_flags
+
+    ext_modules.append(
+        SyclExtension(
+            name="flash_attn_2_xpu",
+            sources=renamed_sources,
+            extra_compile_args={
+                "cxx": ["-O3", "-std=c++20"] + sycl_tla_compile_flags,
+                "sycl": ["-O3", "-DNDEBUG"] + sycl_tla_compile_flags + extra_flags,
+            },
+            include_dirs=[
+                Path(this_dir) / "csrc" / "flash_attn_xpu",
+                Path(this_dir) / "csrc" / "sycl-tla" / "include",
+                Path(this_dir) / "csrc" / "sycl-tla" / "tools" / "util" / "include",
+            ],
+        )
+    )
 
 
 def get_package_version():
@@ -511,6 +608,9 @@ def get_wheel_url():
         torch_hip_version = get_hip_version()
         hip_version = f"{torch_hip_version.major}{torch_hip_version.minor}"
         wheel_filename = f"{PACKAGE_NAME}-{flash_version}+rocm{hip_version}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl"
+    elif IS_XPU:
+        sycl_version = f"{torch.version.xpu}"
+        wheel_filename = f"{PACKAGE_NAME}-{flash_version}+xpu{sycl_version}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl"
     else:
         # Determine the version numbers that will be used to determine the correct wheel
         # We're using the CUDA version used to build torch, not the one currently installed
@@ -591,6 +691,15 @@ class NinjaBuildExtension(BuildExtension):
             os.environ["MAX_JOBS"] = str(max_jobs)
 
         super().__init__(*args, **kwargs)
+
+    def run(self):
+        super().run()
+
+        # cleanup the copied .sycl files after build to avoid confusion and potential issues with git
+        if IS_XPU:
+            sycl_files = glob.glob("csrc/flash_attn_xpu/*.sycl")
+            remove_sycl_files(sycl_files)
+
 
 
 setup(
